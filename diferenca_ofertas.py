@@ -3,7 +3,8 @@ import pandas as pd
 import os
 import re
 from openpyxl import load_workbook
-from openpyxl.styles import Font, Alignment
+from openpyxl.styles import Font, Alignment, PatternFill
+from openpyxl.utils.dataframe import dataframe_to_rows
 
 def sanitize_sheet_name(name):
     """Remove caracteres inválidos para nomes de aba do Excel"""
@@ -84,6 +85,68 @@ def process_pdf_to_dataframe(pdf_path):
     
     return df, date, filename
 
+def compare_dataframes(df1, df2, date1, date2):
+    """Compara dois dataframes e retorna um dataframe com as diferenças"""
+    # Criar cópias para não modificar os originais
+    df1 = df1.copy()
+    df2 = df2.copy()
+    
+    # Padronizar colunas de código de referência
+    df1['COD_REF'] = df1.iloc[:, 0].str.strip()
+    df2['COD_REF'] = df2.iloc[:, 0].str.strip()
+    
+    # Encontrar todos os códigos únicos
+    all_codes = set(df1['COD_REF']).union(set(df2['COD_REF']))
+    
+    differences = []
+    red_fill = PatternFill(start_color='FFCCCB', end_color='FFCCCB', fill_type='solid')
+    
+    for code in all_codes:
+        row1 = df1[df1['COD_REF'] == code]
+        row2 = df2[df2['COD_REF'] == code]
+        
+        # Caso 1: código existe apenas em um dataframe
+        if row1.empty or row2.empty:
+            source_df = df1 if row2.empty else df2
+            source_date = date1 if row2.empty else date2
+            row = source_df[source_df['COD_REF'] == code].iloc[0].copy()
+            row['ORIGEM'] = f"Exclusivo em {source_date}"
+            differences.append((row.to_dict(), True))  # True = linha toda destacada
+            continue
+        
+        # Caso 2: código existe em ambos, mas há diferenças
+        row1 = row1.iloc[0]
+        row2 = row2.iloc[0]
+        
+        different_columns = []
+        merged_row = row1.copy()
+        
+        for col in df1.columns:
+            if col == 'COD_REF':
+                continue
+                
+            val1 = str(row1[col]).strip()
+            val2 = str(row2[col]).strip()
+            
+            if val1 != val2:
+                different_columns.append(col)
+                merged_row[col] = f"{val1}/{val2}"
+        
+        if different_columns:
+            merged_row['ORIGEM'] = f"Diferença em {', '.join(different_columns)}"
+            differences.append((merged_row.to_dict(), different_columns))
+    
+    if not differences:
+        return None
+    
+    # Criar dataframe de diferenças
+    diff_df = pd.DataFrame([diff[0] for diff in differences])
+    
+    # Remover coluna auxiliar COD_REF
+    diff_df = diff_df.drop(columns=['COD_REF'], errors='ignore')
+    
+    return diff_df, [(diff[1], idx) for idx, diff in enumerate(differences)]
+
 def pdfs_to_excel_with_sheets(pdf_paths, output_excel_path=None):
     """Converte múltiplos PDFs para um único Excel com abas diferentes"""
     try:
@@ -98,38 +161,84 @@ def pdfs_to_excel_with_sheets(pdf_paths, output_excel_path=None):
         # Criar um writer Excel
         writer = pd.ExcelWriter(output_excel_path, engine='openpyxl')
         
+        # Processar todos os PDFs primeiro
+        processed_data = []
         for pdf_path in pdf_paths:
             df, date, filename = process_pdf_to_dataframe(pdf_path)
             if df is not None:
-                # Usar a data sanitizada como nome da aba
-                sheet_name = date if date else sanitize_sheet_name(filename)
+                processed_data.append((df, date, filename, pdf_path))
+        
+        # Escrever cada PDF em uma aba separada
+        for df, date, filename, pdf_path in processed_data:
+            sheet_name = date if date else sanitize_sheet_name(filename)
+            
+            # Se a data já existir como aba, adiciona um sufixo
+            original_sheet_name = sheet_name
+            counter = 1
+            while sheet_name in writer.book.sheetnames:
+                sheet_name = f"{original_sheet_name}_{counter}"
+                counter += 1
+            
+            # Escrever no Excel
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+            
+            # Formatar o cabeçalho
+            ws = writer.book[sheet_name]
+            ws.insert_rows(1)
+            ws['A1'] = f"{filename} - {date.replace('_', ' ') if date else filename}"
+            ws.merge_cells('A1:I1')
+            
+            # Configurar estilo
+            header_font = Font(bold=True, size=12)
+            header_alignment = Alignment(horizontal='center')
+            
+            for row in ws.iter_rows(min_row=1, max_row=1):
+                for cell in row:
+                    cell.font = header_font
+                    cell.alignment = header_alignment
+            
+            print(f"Processado: {pdf_path} -> aba '{sheet_name}' ({len(df)} linhas)")
+        
+        # Adicionar aba de diferenças se houver exatamente 2 PDFs
+        if len(processed_data) == 2:
+            df1, date1, filename1, _ = processed_data[0]
+            df2, date2, filename2, _ = processed_data[1]
+            
+            comparison_result = compare_dataframes(df1, df2, date1, date2)
+            
+            if comparison_result:
+                diff_df, differences_info = comparison_result
                 
-                # Se a data já existir como aba, adiciona um sufixo
-                original_sheet_name = sheet_name
-                counter = 1
-                while sheet_name in writer.book.sheetnames:
-                    sheet_name = f"{original_sheet_name}_{counter}"
-                    counter += 1
+                # Escrever o dataframe de diferenças
+                diff_df.to_excel(writer, sheet_name="Diferenças", index=False)
+                ws_diff = writer.book["Diferenças"]
                 
-                # Escrever no Excel
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                # Configurar cabeçalho
+                ws_diff.insert_rows(1)
+                ws_diff['A1'] = f"Diferenças entre {date1} e {date2}"
+                ws_diff.merge_cells('A1:I1')
                 
-                # Formatar o cabeçalho
-                ws = writer.book[sheet_name]
-                ws.insert_rows(1)
-                ws['A1'] = f"{filename} - {date.replace('_', ' ') if date else filename}"
-                ws.merge_cells('A1:I1')
-                
-                # Configurar estilo
-                header_font = Font(bold=True, size=12)
-                header_alignment = Alignment(horizontal='center')
-                
-                for row in ws.iter_rows(min_row=1, max_row=1):
+                for row in ws_diff.iter_rows(min_row=1, max_row=1):
                     for cell in row:
                         cell.font = header_font
                         cell.alignment = header_alignment
                 
-                print(f"Processado: {pdf_path} -> aba '{sheet_name}' ({len(df)} linhas)")
+                # Aplicar formatação nas diferenças
+                red_fill = PatternFill(start_color='FFCCCB', end_color='FFCCCB', fill_type='solid')
+                
+                for diff_info, row_idx in differences_info:
+                    # Ajustar o índice para a linha correta (cabeçalho + 2 linhas adicionais)
+                    excel_row = row_idx + 3  # 1 cabeçalho + 1 linha de título + 1 base 1
+                    
+                    if diff_info is True:  # Linha inteira diferente
+                        for col in range(1, len(diff_df.columns) + 1):
+                            ws_diff.cell(row=excel_row, column=col).fill = red_fill
+                    else:  # Apenas colunas específicas diferentes
+                        for col_name in diff_info:
+                            col_idx = diff_df.columns.get_loc(col_name) + 1  # +1 para coluna base 1
+                            ws_diff.cell(row=excel_row, column=col_idx).fill = red_fill
+                
+                print(f"\nAba 'Diferenças' criada com {len(diff_df)} linhas diferentes")
         
         # Salvar o arquivo Excel
         writer.close()
