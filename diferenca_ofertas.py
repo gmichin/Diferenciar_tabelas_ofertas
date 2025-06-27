@@ -5,6 +5,8 @@ import re
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.utils import get_column_letter
 
 def sanitize_sheet_name(name):
     """Remove caracteres inválidos para nomes de aba do Excel"""
@@ -147,8 +149,148 @@ def compare_dataframes(df1, df2, date1, date2):
     
     return diff_df, [(diff[1], idx) for idx, diff in enumerate(differences)]
 
+def create_excel_table(ws, df, start_row, start_col=1, table_name=None):
+    """Cria uma tabela formatada no Excel com filtros sem duplicar cabeçalho"""
+    # Escrever apenas os dados (sem cabeçalho)
+    for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=False), start_row):
+        for c_idx, value in enumerate(row, start_col):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+    
+    # Adicionar cabeçalho manualmente com formatação
+    header_font = Font(bold=True)
+    for c_idx, column_name in enumerate(df.columns, start_col):
+        cell = ws.cell(row=start_row-1, column=c_idx, value=column_name)
+        cell.font = header_font
+    
+    # Determinar o intervalo da tabela (incluindo cabeçalho)
+    max_row = start_row + len(df) - 1
+    max_col = start_col + len(df.columns) - 1
+    
+    # Criar o nome da tabela se não fornecido
+    if table_name is None:
+        table_name = f"Table_{ws.title}_{start_row}"
+        table_name = re.sub(r'\W+', '_', table_name)
+    
+    # Criar o objeto Table (incluindo cabeçalho na referência)
+    tab = Table(displayName=table_name, 
+               ref=f"{get_column_letter(start_col)}{start_row-1}:{get_column_letter(max_col)}{max_row}")
+    
+    # Adicionar um estilo padrão com filtros
+    style = TableStyleInfo(name="TableStyleMedium9", showFirstColumn=False,
+                         showLastColumn=False, showRowStripes=True, showColumnStripes=False)
+    tab.tableStyleInfo = style
+    
+    # Adicionar a tabela à planilha
+    ws.add_table(tab)
+    
+    # Ajustar largura das colunas
+    for col_idx in range(start_col, max_col + 1):
+        max_length = max(
+            len(str(df.columns[col_idx-start_col])),  # Tamanho do cabeçalho
+            df.iloc[:, col_idx-start_col].astype(str).str.len().max()  # Tamanho dos dados
+        )
+        adjusted_width = (max_length + 2) * 1.2
+        ws.column_dimensions[get_column_letter(col_idx)].width = adjusted_width
+    
+    return ws
+
 def pdfs_to_excel_with_sheets(pdf_paths, output_excel_path=None):
     """Converte múltiplos PDFs para um único Excel com abas diferentes"""
+    try:
+        if not pdf_paths:
+            print("Nenhum arquivo PDF fornecido.")
+            return
+        
+        if output_excel_path is None:
+            output_excel_path = os.path.join(os.path.dirname(pdf_paths[0]), "Tabelas_Consolidadas.xlsx")
+        
+        # Criar um writer Excel
+        writer = pd.ExcelWriter(output_excel_path, engine='openpyxl')
+        writer.book = load_workbook(output_excel_path) if os.path.exists(output_excel_path) else writer.book
+        
+        # Processar todos os PDFs primeiro
+        processed_data = []
+        for pdf_path in pdf_paths:
+            df, date, filename = process_pdf_to_dataframe(pdf_path)
+            if df is not None:
+                processed_data.append((df, date, filename, pdf_path))
+        
+        # Escrever cada PDF em uma aba separada
+        for df, date, filename, pdf_path in processed_data:
+            sheet_name = date if date else sanitize_sheet_name(filename)
+            
+            # Se a data já existir como aba, adiciona um sufixo
+            original_sheet_name = sheet_name
+            counter = 1
+            while sheet_name in writer.book.sheetnames:
+                sheet_name = f"{original_sheet_name}_{counter}"
+                counter += 1
+            
+            # Criar nova aba
+            ws = writer.book.create_sheet(sheet_name)
+            
+            # Adicionar título mesclado
+            ws['A1'] = f"{filename} - {date.replace('_', ' ') if date else filename}"
+            ws.merge_cells(f'A1:{get_column_letter(len(df.columns))}1')
+            
+            # Configurar estilo do título
+            title_font = Font(bold=True, size=12)
+            title_alignment = Alignment(horizontal='center')
+            ws['A1'].font = title_font
+            ws['A1'].alignment = title_alignment
+            
+            # Criar tabela formatada com filtros (começa na linha 3)
+            create_excel_table(ws, df, start_row=3, table_name=f"Tabela_{sheet_name}")
+            
+            print(f"Processado: {pdf_path} -> aba '{sheet_name}' ({len(df)} linhas)")
+        
+        # Adicionar aba de diferenças se houver exatamente 2 PDFs
+        if len(processed_data) == 2:
+            df1, date1, filename1, _ = processed_data[0]
+            df2, date2, filename2, _ = processed_data[1]
+            
+            comparison_result = compare_dataframes(df1, df2, date1, date2)
+            
+            if comparison_result:
+                diff_df, differences_info = comparison_result
+                
+                # Criar aba de diferenças
+                ws_diff = writer.book.create_sheet("Diferenças")
+                
+                # Adicionar título
+                ws_diff['A1'] = f"Diferenças entre {date1} e {date2}"
+                ws_diff.merge_cells(f'A1:{get_column_letter(len(diff_df.columns))}1')
+                ws_diff['A1'].font = title_font
+                ws_diff['A1'].alignment = title_alignment
+                
+                # Criar tabela de diferenças
+                create_excel_table(ws_diff, diff_df, start_row=3, table_name="Tabela_Diferencas")
+                
+                # Aplicar formatação nas diferenças
+                red_fill = PatternFill(start_color='FFCCCB', end_color='FFCCCB', fill_type='solid')
+                
+                for diff_info, row_idx in differences_info:
+                    excel_row = row_idx + 3  # Ajuste para a posição correta
+                    
+                    if diff_info is True:  # Linha inteira diferente
+                        for col in range(1, len(diff_df.columns) + 1):
+                            ws_diff.cell(row=excel_row, column=col).fill = red_fill
+                    else:  # Apenas colunas específicas diferentes
+                        for col_name in diff_info:
+                            col_idx = diff_df.columns.get_loc(col_name) + 1
+                            ws_diff.cell(row=excel_row, column=col_idx).fill = red_fill
+                
+                print(f"\nAba 'Diferenças' criada com {len(diff_df)} linhas diferentes")
+        
+        # Salvar o arquivo Excel
+        writer.close()
+        print(f"\nArquivo Excel gerado com sucesso: {output_excel_path}")
+    
+    except Exception as e:
+        print(f"Erro durante o processamento: {str(e)}")
+
+def pdfs_to_excel_with_sheets(pdf_paths, output_excel_path=None):
+    """Converte múltiplos PDFs para um único Excel com abas diferentes e tabelas formatadas"""
     try:
         if not pdf_paths:
             print("Nenhum arquivo PDF fornecido.")
@@ -179,23 +321,28 @@ def pdfs_to_excel_with_sheets(pdf_paths, output_excel_path=None):
                 sheet_name = f"{original_sheet_name}_{counter}"
                 counter += 1
             
-            # Escrever no Excel
+            # Escrever no Excel (sem índice)
             df.to_excel(writer, sheet_name=sheet_name, index=False)
             
-            # Formatar o cabeçalho
+            # Acessar a planilha
             ws = writer.book[sheet_name]
+            
+            # Inserir linha de título
             ws.insert_rows(1)
             ws['A1'] = f"{filename} - {date.replace('_', ' ') if date else filename}"
-            ws.merge_cells('A1:I1')
+            ws.merge_cells(f'A1:{get_column_letter(len(df.columns))}1')
             
-            # Configurar estilo
-            header_font = Font(bold=True, size=12)
-            header_alignment = Alignment(horizontal='center')
+            # Configurar estilo do título
+            title_font = Font(bold=True, size=12)
+            title_alignment = Alignment(horizontal='center')
             
             for row in ws.iter_rows(min_row=1, max_row=1):
                 for cell in row:
-                    cell.font = header_font
-                    cell.alignment = header_alignment
+                    cell.font = title_font
+                    cell.alignment = title_alignment
+            
+            # Criar tabela formatada com filtros (começa na linha 3 devido ao título)
+            create_excel_table(ws, df, start_row=3, table_name=f"Tabela_{sheet_name}")
             
             print(f"Processado: {pdf_path} -> aba '{sheet_name}' ({len(df)} linhas)")
         
@@ -216,12 +363,12 @@ def pdfs_to_excel_with_sheets(pdf_paths, output_excel_path=None):
                 # Configurar cabeçalho
                 ws_diff.insert_rows(1)
                 ws_diff['A1'] = f"Diferenças entre {date1} e {date2}"
-                ws_diff.merge_cells('A1:I1')
+                ws_diff.merge_cells(f'A1:{get_column_letter(len(diff_df.columns))}1')
                 
                 for row in ws_diff.iter_rows(min_row=1, max_row=1):
                     for cell in row:
-                        cell.font = header_font
-                        cell.alignment = header_alignment
+                        cell.font = title_font
+                        cell.alignment = title_alignment
                 
                 # Aplicar formatação nas diferenças
                 red_fill = PatternFill(start_color='FFCCCB', end_color='FFCCCB', fill_type='solid')
@@ -237,6 +384,9 @@ def pdfs_to_excel_with_sheets(pdf_paths, output_excel_path=None):
                         for col_name in diff_info:
                             col_idx = diff_df.columns.get_loc(col_name) + 1  # +1 para coluna base 1
                             ws_diff.cell(row=excel_row, column=col_idx).fill = red_fill
+                
+                # Criar tabela formatada com filtros para as diferenças
+                create_excel_table(ws_diff, diff_df, start_row=3, table_name="Tabela_Diferencas")
                 
                 print(f"\nAba 'Diferenças' criada com {len(diff_df)} linhas diferentes")
         
