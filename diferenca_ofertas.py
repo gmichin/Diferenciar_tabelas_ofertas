@@ -8,6 +8,16 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
 
+def clean_monetary_value(value):
+    """Remove espaços indevidos em valores monetários"""
+    if isinstance(value, str) and 'R$' in value:
+        # Remove espaços entre números após o R$
+        parts = value.split('R$')
+        if len(parts) > 1:
+            number_part = parts[1].replace(' ', '')  # Remove todos os espaços
+            return f"R$ {number_part.strip()}"
+    return value
+
 def sanitize_sheet_name(name):
     """Remove caracteres inválidos para nomes de aba do Excel"""
     invalid_chars = ['\\', '/', '*', '[', ']', ':', '?']
@@ -77,7 +87,15 @@ def process_pdf_to_dataframe(pdf_path):
     data_rows = []
     for row in all_tables[header_row_idx+1:]:
         if len(row) == len(actual_headers):  # Só adiciona se tiver número correto de colunas
-            data_rows.append(row)
+            # Aplicar limpeza nos valores monetários
+            cleaned_row = []
+            for cell in row:
+                if isinstance(cell, str) and any(col in col_name for col_name in actual_headers 
+                                               for col in ['VALOR', 'R$']):
+                    cleaned_row.append(clean_monetary_value(cell))
+                else:
+                    cleaned_row.append(cell)
+            data_rows.append(cleaned_row)
     
     # Criar DataFrame
     df = pd.DataFrame(data_rows, columns=actual_headers)
@@ -97,6 +115,13 @@ def compare_dataframes(df1, df2, date1, date2):
     df1['COD_REF'] = df1.iloc[:, 0].str.strip()
     df2['COD_REF'] = df2.iloc[:, 0].str.strip()
     
+    # Normalizar valores monetários antes da comparação
+    monetary_cols = [col for col in df1.columns if any(key in col for key in ['VALOR', 'R$'])]
+    
+    for col in monetary_cols:
+        df1[col] = df1[col].apply(clean_monetary_value)
+        df2[col] = df2[col].apply(clean_monetary_value)
+        
     # Encontrar todos os códigos únicos
     all_codes = set(df1['COD_REF']).union(set(df2['COD_REF']))
     
